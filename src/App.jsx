@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import axios from 'axios';
 import Navigation from './components/Navigation';
 import Sidebar from './components/Sidebar';
@@ -10,12 +10,88 @@ function App() {
   const [selectedMetal, setSelectedMetal] = useState('steel');
   const [predictions, setPredictions] = useState([]);
   const [heatmapData, setHeatmapData] = useState([]);
+  const [hiResPending, setHiResPending] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
+  const [dateLimits, setDateLimits] = useState({ min: null, max: null });
+  const [germanyBBox, setGermanyBBox] = useState(null); // {minLon,maxLon,minLat,maxLat}
   const [dateRange, setDateRange] = useState({
-    start: '2024-11-20',
-    end: '2024-11-30'
+    start: '2023-07-01',
+    end: '2023-07-30'
   });
+
+  // Fetch available date limits from backend
+  useEffect(() => {
+    const fetchLimits = async () => {
+      try {
+        const resp = await axios.get(`${API_BASE_URL}/test-mongodb`);
+        const oldest = (resp.data?.date_range?.oldest || '').slice(0, 10);
+        const newest = (resp.data?.date_range?.newest || '').slice(0, 10);
+        if (oldest && newest) {
+          setDateLimits({ min: oldest, max: newest });
+          // Clamp current selection into limits
+          const clamp = (d) => {
+            if (!d) return oldest;
+            if (d < oldest) return oldest;
+            if (d > newest) return newest;
+            return d;
+          };
+          setDateRange(prev => {
+            const start = clamp(prev.start);
+            const end = clamp(prev.end);
+            // Ensure start <= end
+            return { start: start > end ? oldest : start, end: end };
+          });
+        }
+      } catch (e) {
+        console.warn('Failed to fetch date limits from /test-mongodb', e);
+      }
+    };
+    fetchLimits();
+  }, []);
+
+  // Load Germany bounding box once (local file or remote fallback)
+  useEffect(() => {
+    const loadBBox = async () => {
+      const candidates = [
+        new URL('./Germany_ADM0.geojson', import.meta.url).href,
+        '/Germany_ADM0.geojson',
+        'https://datahub.io/core/geo-countries/r/countries.geojson'
+      ];
+      let gj = null;
+      for (const url of candidates) {
+        try {
+          const r = await axios.get(url);
+          const data = r.data;
+          if (url.includes('countries.geojson')) {
+            gj = data.features?.find(f => (f.properties?.ADMIN || f.properties?.name) === 'Germany') || null;
+          } else {
+            gj = data;
+          }
+          if (gj) break;
+        } catch (e) {}
+      }
+      if (!gj) return;
+      const geom = gj.type === 'Feature' ? gj.geometry : (gj.type === 'FeatureCollection' ? gj.features?.[0]?.geometry : gj.geometry || gj);
+      const coords = [];
+      const pushPoly = (poly) => {
+        for (const ring of poly) for (const [lng, lat] of ring) coords.push([lat, lng]);
+      };
+      if (geom?.type === 'Polygon') pushPoly(geom.coordinates || []);
+      else if (geom?.type === 'MultiPolygon') for (const poly of geom.coordinates || []) pushPoly(poly);
+      if (coords.length) {
+        const lats = coords.map(c => c[0]);
+        const lons = coords.map(c => c[1]);
+        setGermanyBBox({
+          minLon: Math.min(...lons),
+          maxLon: Math.max(...lons),
+          minLat: Math.min(...lats),
+          maxLat: Math.max(...lats)
+        });
+      }
+    };
+    loadBBox();
+  }, []);
 
   const handleFetchPredictions = async (startDate, endDate, metalType = null) => {
     setLoading(true);
@@ -59,17 +135,18 @@ function App() {
 
       // Fire high-resolution heatmap request in parallel (best-effort)
       try {
+        setHiResPending(true);
         const smoothBody = {
           start_date: startDate,
           end_date: endDate,
           metal_type: metal,
-          grid_resolution_deg: 0.1,
-          min_lon: 5.5,
-          max_lon: 15.5,
-          min_lat: 47.0,
-          max_lat: 55.5,
+          grid_resolution_deg: 0.03,
+          min_lon: germanyBBox?.minLon ?? 5.5,
+          max_lon: germanyBBox?.maxLon ?? 15.5,
+          min_lat: germanyBBox?.minLat ?? 47.0,
+          max_lat: germanyBBox?.maxLat ?? 55.5,
           method: 'cubic',
-          mask_geojson_path: 'de.json',
+          mask_geojson_path: 'Germany_ADM0.geojson',
           include_nulls: false
         };
         const smoothResp = await axios.post(`${API_BASE_URL}/predict-smooth`, smoothBody);
@@ -82,9 +159,11 @@ function App() {
           smoothData = smoothResp.data;
         }
         setHeatmapData(smoothData);
+        setHiResPending(false);
       } catch (smoothErr) {
         console.warn('High-res heatmap fetch failed, falling back to points:', smoothErr);
         setHeatmapData([]);
+        setHiResPending(false);
       }
     } catch (err) {
       console.error('Error fetching predictions:', err);
@@ -96,6 +175,7 @@ function App() {
       );
       setPredictions([]);
       setHeatmapData([]);
+      setHiResPending(false);
     } finally {
       setLoading(false);
     }
@@ -121,6 +201,10 @@ function App() {
         <Sidebar 
           onFetchPredictions={handleFetchPredictions}
           loading={loading}
+          minDate={dateLimits.min}
+          maxDate={dateLimits.max}
+          defaultStart={dateRange.start}
+          defaultEnd={dateRange.end}
         />
         
         <main className="flex-1 relative">
@@ -167,6 +251,7 @@ function App() {
               loading={loading}
               selectedMetal={selectedMetal}
               heatmapData={heatmapData}
+              hiResPending={hiResPending}
             />
           )}
         </main>

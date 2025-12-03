@@ -1,12 +1,26 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 
-const Sidebar = ({ onFetchPredictions, loading }) => {
-  const [startDate, setStartDate] = useState('2024-11-20');
-  const [endDate, setEndDate] = useState('2024-11-30');
+const Sidebar = ({ onFetchPredictions, loading, minDate, maxDate, defaultStart, defaultEnd }) => {
+  const [startDate, setStartDate] = useState(defaultStart || '2024-11-20');
+  const [endDate, setEndDate] = useState(defaultEnd || '2024-11-30');
+
+  useEffect(() => {
+    if (defaultStart) setStartDate(defaultStart);
+    if (defaultEnd) setEndDate(defaultEnd);
+  }, [defaultStart, defaultEnd]);
+
+  const clampToLimits = (d) => {
+    if (!d) return d;
+    if (minDate && d < minDate) return minDate;
+    if (maxDate && d > maxDate) return maxDate;
+    return d;
+  };
 
   const handleSubmit = (e) => {
     e.preventDefault();
-    onFetchPredictions(startDate, endDate);
+    const s = clampToLimits(startDate);
+    const eDate = clampToLimits(endDate);
+    onFetchPredictions(s, eDate);
   };
 
   return (
@@ -30,6 +44,9 @@ const Sidebar = ({ onFetchPredictions, loading }) => {
               type="date"
               value={startDate}
               onChange={(e) => setStartDate(e.target.value)}
+              min={minDate || undefined}
+              max={maxDate || undefined}
+              lang="en"
               className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition"
               required
             />
@@ -45,6 +62,9 @@ const Sidebar = ({ onFetchPredictions, loading }) => {
               type="date"
               value={endDate}
               onChange={(e) => setEndDate(e.target.value)}
+              min={minDate || undefined}
+              max={maxDate || undefined}
+              lang="en"
               className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent outline-none transition"
               required
             />
@@ -59,16 +79,6 @@ const Sidebar = ({ onFetchPredictions, loading }) => {
               </div>
               <div className="mt-1 text-blue-600">
                 {Math.ceil((new Date(endDate) - new Date(startDate)) / (1000 * 60 * 60 * 24))} days
-              </div>
-            </div>
-          </div>
-
-          {/* Note about data availability */}
-          <div className="bg-amber-50 border border-amber-200 rounded-lg p-3">
-            <div className="text-xs text-amber-800">
-              <div className="font-semibold mb-1">📌 Note</div>
-              <div>
-                Make sure your backend has data for the selected date range. If you get an error, try different dates.
               </div>
             </div>
           </div>
@@ -99,29 +109,6 @@ const Sidebar = ({ onFetchPredictions, loading }) => {
             )}
           </button>
         </form>
-
-        {/* Info Section */}
-        <div className="mt-8 pt-6 border-t border-gray-200">
-          <h3 className="text-sm font-semibold text-gray-700 mb-3">How it works</h3>
-          <ul className="space-y-2 text-xs text-gray-600">
-            <li className="flex items-start">
-              <span className="text-blue-500 mr-2">1.</span>
-              <span>Select a metal type from the top navigation</span>
-            </li>
-            <li className="flex items-start">
-              <span className="text-blue-500 mr-2">2.</span>
-              <span>Choose your prediction date range</span>
-            </li>
-            <li className="flex items-start">
-              <span className="text-blue-500 mr-2">3.</span>
-              <span>Click "Fetch Predictions" to see results</span>
-            </li>
-            <li className="flex items-start">
-              <span className="text-blue-500 mr-2">4.</span>
-              <span>View corrosion rates visualized on the map</span>
-            </li>
-          </ul>
-        </div>
       </div>
     </aside>
   );

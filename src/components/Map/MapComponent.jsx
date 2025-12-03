@@ -1,15 +1,17 @@
 import React, { useEffect, useRef } from 'react';
-import { MapContainer, TileLayer, CircleMarker, Popup, useMap } from 'react-leaflet';
+import { MapContainer, TileLayer, CircleMarker, Popup, useMap, Pane } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import 'leaflet.heat';
 
 // Component to update map view and add heatmap layer
-function MapUpdater({ predictions, heatmapData, showHeatmap, showGrid }) {
+function MapUpdater({ predictions, heatmapData, showHeatmap, showGrid, hiResPending = false, selectedMetal = 'Steel', onHeatmapRangeChange = () => {} }) {
   const map = useMap();
   const heatLayerRef = useRef(null);
   const gridLayerRef = useRef(null);
   const imageOverlayRef = useRef(null);
+  const maskLayerRef = useRef(null);
+  const germanyRingsRef = useRef(null); // [[ [lat,lon], ... ], ...]
   
   // Infer grid resolution (in degrees) from hi-res points
   function estimateGridResolution(points) {
@@ -36,11 +38,28 @@ function MapUpdater({ predictions, heatmapData, showHeatmap, showGrid }) {
     return Math.max(4, Math.round(meters / mpp));
   }
   
-  // Jet-like color map for raster overlay
+  // Thresholds per metal for ISO-like bins (C1-C2 ... C5-CX)
+  function getMetalThresholds(metal) {
+    const m = (metal || 'steel').toLowerCase();
+    if (m === 'zinc') return [0.7, 5, 15, 30, 50]; // C5-CX boundary ~50 (CX 50-180), use 50
+    if (m === 'copper') return [0.9, 5, 12, 25, 50];
+    if (m === 'aluminium' || m === 'aluminum') return [0.6, 2, 5, 10, 12]; // last is upper bound cue
+    // Steel (custom scale already used in app)
+    return [250, 400, 550, 700, 900];
+  }
+  function hexToRgba(hex, alpha = 220) {
+    const value = hex.replace('#', '');
+    const r = parseInt(value.substring(0, 2), 16);
+    const g = parseInt(value.substring(2, 4), 16);
+    const b = parseInt(value.substring(4, 6), 16);
+    return [r, g, b, alpha];
+  }
+  // Jet-like color map for raster overlay (blue->green->yellow->red)
   function jetColor(t) {
-    const r = Math.max(0, Math.min(1, 1.5 - Math.abs(4 * t - 3)));
-    const g = Math.max(0, Math.min(1, 1.5 - Math.abs(4 * t - 2)));
-    const b = Math.max(0, Math.min(1, 1.5 - Math.abs(4 * t - 1)));
+    const clamp = (v) => Math.max(0, Math.min(1, v));
+    const r = clamp(1.5 - Math.abs(4 * t - 3));
+    const g = clamp(1.5 - Math.abs(4 * t - 2));
+    const b = clamp(1.5 - Math.abs(4 * t - 1));
     return [Math.round(r * 255), Math.round(g * 255), Math.round(b * 255), 220];
   }
 
@@ -53,17 +72,19 @@ function MapUpdater({ predictions, heatmapData, showHeatmap, showGrid }) {
     if (width === 0 || height === 0) return null;
     const latIndex = new Map(lats.map((v,i)=>[v,i]));
     const lonIndex = new Map(lons.map((v,i)=>[v,i]));
+    // Continuous normalization for heatmap (independent of metal)
     const values = points
       .map(p => p.value ?? p.predicted_corrosion_rate ?? p.rate ?? p.corrosion_rate)
       .filter(v => typeof v === 'number' && isFinite(v));
     const minVal = Math.min(...values);
     const maxVal = Math.max(...values);
     const denom = maxVal - minVal || 1;
-    const canvas = document.createElement('canvas');
-    canvas.width = width;
-    canvas.height = height;
-    const ctx = canvas.getContext('2d');
-    const imageData = ctx.createImageData(width, height);
+    // Draw raw image to an offscreen buffer first
+    const rawCanvas = document.createElement('canvas');
+    rawCanvas.width = width;
+    rawCanvas.height = height;
+    const rawCtx = rawCanvas.getContext('2d');
+    const imageData = rawCtx.createImageData(width, height);
     // Fill transparent
     for (let i = 0; i < imageData.data.length; i += 4) {
       imageData.data[i+3] = 0;
@@ -75,6 +96,7 @@ function MapUpdater({ predictions, heatmapData, showHeatmap, showGrid }) {
       if (!latIndex.has(lat) || !lonIndex.has(lon) || !Number.isFinite(val)) return;
       const rIdx = height - 1 - latIndex.get(lat); // flip vertically for north-up
       const cIdx = lonIndex.get(lon);
+      // Continuous blue->red heatmap based on normalized value
       const t = Math.max(0, Math.min(1, (val - minVal) / denom));
       const [rr, gg, bb, aa] = jetColor(t);
       const base = (rIdx * width + cIdx) * 4;
@@ -83,13 +105,59 @@ function MapUpdater({ predictions, heatmapData, showHeatmap, showGrid }) {
       imageData.data[base + 2] = bb;
       imageData.data[base + 3] = aa; // alpha
     });
-    ctx.putImageData(imageData, 0, 0);
+    rawCtx.putImageData(imageData, 0, 0);
+    // Final canvas that we may clip with Germany polygon
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
     const res = estimateGridResolution(points);
     const minLat = lats[0] - res / 2;
     const maxLat = lats[lats.length - 1] + res / 2;
     const minLon = lons[0] - res / 2;
     const maxLon = lons[lons.length - 1] + res / 2;
-    return { url: canvas.toDataURL('image/png'), bounds: [[minLat, minLon], [maxLat, maxLon]] };
+
+    // Note: We keep the raster un-clipped to preserve edge pixels.
+    // Visual masking (leaflet-mask) hides everything outside Germany.
+    // Compute projection helper using Leaflet CRS
+    const map = L.map(document.createElement('div')); // temporary map object
+    const crs = map.options.crs || L.CRS.EPSG3857;
+    const bounds = L.latLngBounds([ [minLat, minLon], [maxLat, maxLon] ]);
+    const nw = crs.project(bounds.getNorthWest());
+    const se = crs.project(bounds.getSouthEast());
+    const widthPx = canvas.width;
+    const heightPx = canvas.height;
+    const xScale = widthPx / (se.x - nw.x);
+    const yScale = heightPx / (nw.y - se.y);
+
+    // Apply Germany polygon clip
+    if (germanyRingsRef.current && germanyRingsRef.current.length > 0) {
+      ctx.save();
+      ctx.beginPath();
+      germanyRingsRef.current.forEach(ring => {
+        ring.forEach(([lat, lon], idx) => {
+          const p = crs.project(L.latLng(lat, lon));
+          const x = (p.x - nw.x) * xScale;
+          const y = (nw.y - p.y) * yScale;
+          if (idx === 0) ctx.moveTo(x, y);
+          else ctx.lineTo(x, y);
+        });
+      });
+      ctx.closePath();
+      ctx.clip();
+    }
+
+    // Draw raster only inside clip region
+    ctx.drawImage(rawCanvas, 0, 0);
+    ctx.restore();
+
+    return {
+      url: canvas.toDataURL('image/png'),
+      bounds: [[minLat, minLon], [maxLat, maxLon]],
+      min: minVal,
+      max: maxVal
+    };
+
   }
 
 
@@ -163,14 +231,15 @@ function MapUpdater({ predictions, heatmapData, showHeatmap, showGrid }) {
 
     // Add heatmap if enabled: prefer high-res heatmapData; fallback to predictions
     const hasHiRes = Array.isArray(heatmapData) && heatmapData.length > 0;
-    if (showHeatmap && (hasHiRes || (predictions && predictions.length > 0))) {
+    if (showHeatmap && (hasHiRes || (!hiResPending && predictions && predictions.length > 0))) {
       try {
         console.log('Rendering heat visualization with', hasHiRes ? 'raster overlay (hi-res)' : 'point kernel');
         if (hasHiRes) {
           const raster = buildRasterFromPoints(heatmapData);
           if (raster) {
-            imageOverlayRef.current = L.imageOverlay(raster.url, raster.bounds, { opacity: 0.8, interactive: false });
+            imageOverlayRef.current = L.imageOverlay(raster.url, raster.bounds, { opacity: 0.8, interactive: false, pane: 'heat-pane' });
             imageOverlayRef.current.addTo(map);
+            try { onHeatmapRangeChange({ min: raster.min, max: raster.max }); } catch (e) {}
           }
         } else {
           let heatData = predictions.map(pred => {
@@ -191,12 +260,16 @@ function MapUpdater({ predictions, heatmapData, showHeatmap, showGrid }) {
             return [lat, lon, intensity];
           });
 
+          try {
+            const vals = predictions.map(p => p.predicted_corrosion_rate).filter(v => typeof v === 'number' && isFinite(v));
+            if (vals.length) onHeatmapRangeChange({ min: Math.min(...vals), max: Math.max(...vals) });
+          } catch (e) {}
+
           const centerLat = map.getCenter().lat || 0;
           const initialRadius = getPixelRadiusForMeters(map.getZoom(), centerLat, baseHeatRadiusMeters);
           const initialBlur = Math.round(initialRadius * 0.65);
           heatLayerRef.current = L.heatLayer(heatData, {
             radius: initialRadius,
-            blur: initialBlur,
             minOpacity: 0.35,
             max: 1.0,
             gradient: {
@@ -206,7 +279,8 @@ function MapUpdater({ predictions, heatmapData, showHeatmap, showGrid }) {
               0.6: 'rgba(255, 255, 0, 0.95)',
               0.8: 'rgba(255, 127, 0, 1)',
               1.0: 'rgba(255, 0, 0, 1)'
-            }
+            },
+            pane: 'heat-pane'
           }).addTo(map);
 
           const handleZoomEnd = () => {
@@ -247,7 +321,7 @@ function MapUpdater({ predictions, heatmapData, showHeatmap, showGrid }) {
             const lon = rec.lon ?? rec.lng ?? rec.longitude;
             const rate = rec.value ?? rec.predicted_corrosion_rate ?? rec.rate ?? rec.corrosion_rate;
             if (!Number.isFinite(lat) || !Number.isFinite(lon) || !Number.isFinite(rate)) return;
-            const color = getColor(rate);
+            const color = getColorForMetal(selectedMetal, rate);
             const bounds = [
               [lat - half, lon - half],
               [lat + half, lon + half]
@@ -256,7 +330,8 @@ function MapUpdater({ predictions, heatmapData, showHeatmap, showGrid }) {
               stroke: false,
               fill: true,
               fillColor: color,
-              fillOpacity: 0.5
+              fillOpacity: 0.5,
+              pane: 'grid-pane'
             });
             rect.addTo(layerGroup);
           });
@@ -274,7 +349,7 @@ function MapUpdater({ predictions, heatmapData, showHeatmap, showGrid }) {
               return;
             }
             const rate = pred.predicted_corrosion_rate;
-            const color = getColor(rate);
+            const color = getColorForMetal(selectedMetal, rate);
             const bounds = [
               [lat - halfSizeDeg, lon - halfSizeDeg],
               [lat + halfSizeDeg, lon + halfSizeDeg]
@@ -283,7 +358,8 @@ function MapUpdater({ predictions, heatmapData, showHeatmap, showGrid }) {
               stroke: false,
               fill: true,
               fillColor: color,
-              fillOpacity: 0.45
+              fillOpacity: 0.45,
+              pane: 'grid-pane'
             });
             rect.addTo(layerGroup);
           });
@@ -314,20 +390,161 @@ function MapUpdater({ predictions, heatmapData, showHeatmap, showGrid }) {
       if (gridLayerRef.current && map) {
         try { map.removeLayer(gridLayerRef.current); } catch (e) {}
       }
+      try { onHeatmapRangeChange(null); } catch (e) {}
     };
   }, [predictions, heatmapData, showHeatmap, showGrid, map]);
+
+  // Apply a visual mask using Germany ADM0 GeoJSON (loaded via URL) and leaflet-mask if available
+  useEffect(() => {
+    if (!map) return;
+    if (maskLayerRef.current) {
+      try { map.removeLayer(maskLayerRef.current); } catch (e) {}
+      maskLayerRef.current = null;
+    }
+    const fetchGermanyRings = async () => {
+      const localUrl = new URL('../../Germany_ADM0.geojson', import.meta.url).href;
+      const candidates = [localUrl, '/Germany_ADM0.geojson', 'https://datahub.io/core/geo-countries/r/countries.geojson'];
+      let gj = null;
+      for (const url of candidates) {
+        try {
+          const r = await fetch(url, { cache: 'force-cache' });
+          if (!r.ok) continue;
+          const j = await r.json();
+          if (url.includes('countries.geojson')) {
+            gj = j.features?.find(f => (f.properties?.ADMIN || f.properties?.name) === 'Germany') || null;
+          } else {
+            gj = j;
+          }
+          if (gj) break;
+        } catch (e) {}
+      }
+      if (!gj) return [];
+      const toLatLng = (ring) => ring.map(([lng, lat]) => [lat, lng]);
+      const rings = [];
+      const geom = gj.type === 'Feature' ? gj.geometry : (gj.type === 'FeatureCollection' ? gj.features?.[0]?.geometry : gj.geometry || gj);
+      if (geom?.type === 'Polygon') {
+        if (geom.coordinates?.[0]) rings.push(toLatLng(geom.coordinates[0]));
+      } else if (geom?.type === 'MultiPolygon') {
+        for (const poly of geom.coordinates || []) {
+          if (poly?.[0]) rings.push(toLatLng(poly[0]));
+        }
+      }
+      return rings;
+    };
+    (async () => {
+      const rings = await fetchGermanyRings();
+      if (!rings || rings.length === 0) return;
+      // Persist rings so we can canvas-clip the raster for exact boundary
+      germanyRingsRef.current = rings;
+      /*      **********  WHITE MASK TO FORCE BORDER **********
+      try {
+        if (L.mask && typeof L.mask === 'function') {
+          maskLayerRef.current = L.mask(rings, { pane: 'mask-pane', opacity: 0, fillOpacity: 1, fillColor: '#ffffff' });
+          maskLayerRef.current.addTo(map);
+          return;
+        }
+      } catch (e) {}
+      const world = [
+        [85, -180],
+        [85, 180],
+        [-85, 180],
+        [-85, -180],
+      ];
+      try {
+        maskLayerRef.current = L.polygon([world, ...rings], {
+          stroke: false,
+          fill: true,
+          fillOpacity: 1.0,
+          fillColor: '#ffffff',
+          interactive: false,
+          pane: 'mask-pane',
+          fillRule: 'evenodd'
+        });
+        maskLayerRef.current.addTo(map);
+      } catch (e) {}
+      */
+    })();
+    return () => {
+      if (maskLayerRef.current && map) {
+        try { map.removeLayer(maskLayerRef.current); } catch (e) {}
+        maskLayerRef.current = null;
+      }
+      germanyRingsRef.current = null;
+    };
+  }, [map, imageOverlayRef.current]);
 
   return null;
 }
 
-// Get color based on corrosion rate (g/m²/yr scale: 100-900+)
-function getColor(rate) {
-  // Normalize rate: 100-900 range for corrosion rates in g/m²/yr
-  if (rate < 250) return '#00ff00'; // Green - low corrosion (C1-C2)
-  if (rate < 400) return '#7fff00'; // Yellow-green (C2-C3)
-  if (rate < 550) return '#ffff00'; // Yellow (C3-C4)
-  if (rate < 700) return '#ff7f00'; // Orange (C4-C5)
-  return '#ff0000'; // Red - high corrosion (C5-CX)
+// Legend items per metal type
+function getLegendItems(metal) {
+  const m = (metal || 'steel').toLowerCase();
+  if (m === 'zinc') {
+    return [
+      { color: '#00ff00', label: 'C1: ≤ 0.7', desc: 'Very Low' },
+      { color: '#7fff00', label: 'C2: 0.7–5', desc: 'Low' },
+      { color: '#ffff00', label: 'C3: 5–15', desc: 'Medium' },
+      { color: '#ff7f00', label: 'C4: 15–30', desc: 'High' },
+      { color: '#ff4500', label: 'C5: 30–60', desc: 'Very High' },
+      { color: '#8b0000', label: 'CX: 60–180', desc: 'Extreme' }
+    ];
+  }
+  if (m === 'copper') {
+    return [
+      { color: '#00ff00', label: 'C1: ≤ 0.9', desc: 'Very Low' },
+      { color: '#7fff00', label: 'C2: 0.9–5', desc: 'Low' },
+      { color: '#ffff00', label: 'C3: 5–12', desc: 'Medium' },
+      { color: '#ff7f00', label: 'C4: 12–25', desc: 'High' },
+      { color: '#ff4500', label: 'C5: 25–50', desc: 'Very High' },
+      { color: '#8b0000', label: 'CX: 50–90', desc: 'Extreme' }
+    ];
+  }
+  if (m === 'steel' || m === 'carbon steel' || m === 'carbonsteel') {
+    return [
+      { color: '#00ff00', label: 'C1: ≤ 10', desc: 'Very Low' },
+      { color: '#7fff00', label: 'C2: 10–200', desc: 'Low' },
+      { color: '#ffff00', label: 'C3: 200–400', desc: 'Medium' },
+      { color: '#ff7f00', label: 'C4: 400–650', desc: 'High' },
+      { color: '#ff4500', label: 'C5: 650–1500', desc: 'Very High' },
+      { color: '#8b0000', label: 'CX: 1500–5500', desc: 'Extreme' }
+    ];
+  }
+  if (m === 'aluminium' || m === 'aluminum') {
+    return [
+      { color: '#00ff00', label: 'C1-C2: < 0.6', desc: 'Very Low-Low' },
+      { color: '#7fff00', label: 'C2-C3: 0.6-2', desc: 'Low-Medium' },
+      { color: '#ffff00', label: 'C3-C4: 2-5', desc: 'Medium-High' },
+      { color: '#ff7f00', label: 'C4-C5: 5-10', desc: 'High-Very High' },
+      { color: '#ff0000', label: 'C5-CX: > 10', desc: 'Very High-Extreme' }
+    ];
+  }
+  // Default to steel if unknown
+  return [
+    { color: '#00ff00', label: 'C1: ≤ 10', desc: 'Very Low' },
+    { color: '#7fff00', label: 'C2: 10–200', desc: 'Low' },
+    { color: '#ffff00', label: 'C3: 200–400', desc: 'Medium' },
+    { color: '#ff7f00', label: 'C4: 400–650', desc: 'High' },
+    { color: '#ff4500', label: 'C5: 650–1500', desc: 'Very High' },
+    { color: '#8b0000', label: 'CX: 1500–5500', desc: 'Extreme' }
+  ];
+}
+
+// Get color based on corrosion rate for given metal
+function getColorForMetal(metal, rate) {
+  const m = (metal || 'steel').toLowerCase();
+  // color bins: green, yellow-green, yellow, orange, orange-red, dark red
+  const colors = ['#00ff00', '#7fff00', '#ffff00', '#ff7f00', '#ff4500', '#8b0000'];
+  const thresholds = (() => {
+    if (m === 'zinc') return [0.7, 5, 15, 30, 60, 180];     // upper bounds per class
+    if (m === 'copper') return [0.9, 5, 12, 25, 50, 90];
+    if (m === 'aluminium' || m === 'aluminum') return [0.6, 2, 5, 10, 12, Number.POSITIVE_INFINITY];
+    // steel
+    return [10, 200, 400, 650, 1500, 5500];
+  })();
+  for (let i = 0; i < thresholds.length; i++) {
+    if (rate <= thresholds[i]) return colors[i] || colors[colors.length - 1];
+  }
+  return colors[colors.length - 1];
 }
 
 /**
@@ -350,13 +567,21 @@ function getColor(rate) {
  * 2. Update the export in src/components/Map/index.js
  * 3. No changes needed elsewhere in the app
  */
-const MapComponent = ({ predictions = [], loading = false, selectedMetal = 'Steel', heatmapData = [] }) => {
+const MapComponent = ({ predictions = [], loading = false, selectedMetal = 'Steel', heatmapData = [], hiResPending = false }) => {
   const defaultCenter = [50, 10]; // Center of Germany (where the data is)
   const defaultZoom = 6;
   const [showHeatmap, setShowHeatmap] = React.useState(true);
-  const [showMarkers, setShowMarkers] = React.useState(false); // Default to heatmap only for better visibility
-  const [showGrid, setShowGrid] = React.useState(false);
-  const [darkMode, setDarkMode] = React.useState(false);
+  const [showMarkers, setShowMarkers] = React.useState(true); // Show point markers by default
+  const [heatRange, setHeatRange] = React.useState(null); // {min, max}
+  const [showCategoryLegend, setShowCategoryLegend] = React.useState(true);
+  const [showHeatLegend, setShowHeatLegend] = React.useState(true);
+  const heatTicks = React.useMemo(() => {
+    if (!heatRange || !Number.isFinite(heatRange.min) || !Number.isFinite(heatRange.max)) return [];
+    const n = 5; // number of tick labels
+    const step = (heatRange.max - heatRange.min) / (n - 1 || 1);
+    return Array.from({ length: n }, (_, i) => heatRange.min + i * step);
+  }, [heatRange]);
+  const markerRendererRef = React.useRef(L.canvas({ pane: 'marker-top', updateWhenZoom: true, padding: 0.1 }));
 
   // Log for debugging
   useEffect(() => {
@@ -401,7 +626,7 @@ const MapComponent = ({ predictions = [], loading = false, selectedMetal = 'Stee
       {/* View Toggle Controls */}
       {(predictions.length > 0 || (Array.isArray(heatmapData) && heatmapData.length > 0)) && (
         <div className="absolute top-4 left-4 z-[1000] bg-white p-3 rounded-lg shadow-lg border-2 border-gray-200">
-          <div className="text-xs font-bold mb-2 text-gray-700">🎨 View Options</div>
+          <div className="text-xs font-bold mb-2 text-gray-700">View Options</div>
           <div className="space-y-2">
             <label className="flex items-center space-x-2 cursor-pointer hover:bg-gray-50 p-1 rounded">
               <input
@@ -410,16 +635,7 @@ const MapComponent = ({ predictions = [], loading = false, selectedMetal = 'Stee
                 onChange={(e) => setShowHeatmap(e.target.checked)}
                 className="rounded w-4 h-4"
               />
-              <span className="text-xs font-medium">🔥 Density Heatmap</span>
-            </label>
-            <label className="flex items-center space-x-2 cursor-pointer hover:bg-gray-50 p-1 rounded">
-              <input
-                type="checkbox"
-                checked={showGrid}
-                onChange={(e) => setShowGrid(e.target.checked)}
-                className="rounded w-4 h-4"
-              />
-              <span className="text-xs font-medium">🧊 Grid Cells (exact values)</span>
+              <span className="text-xs font-medium">Density Heatmap</span>
             </label>
             <label className="flex items-center space-x-2 cursor-pointer hover:bg-gray-50 p-1 rounded">
               <input
@@ -428,22 +644,8 @@ const MapComponent = ({ predictions = [], loading = false, selectedMetal = 'Stee
                 onChange={(e) => setShowMarkers(e.target.checked)}
                 className="rounded w-4 h-4"
               />
-              <span className="text-xs font-medium">📍 Point Markers</span>
+              <span className="text-xs font-medium">Point Markers</span>
             </label>
-            <label className="flex items-center space-x-2 cursor-pointer hover:bg-gray-50 p-1 rounded">
-              <input
-                type="checkbox"
-                checked={darkMode}
-                onChange={(e) => setDarkMode(e.target.checked)}
-                className="rounded w-4 h-4"
-              />
-              <span className="text-xs font-medium">🌙 Dark Map</span>
-            </label>
-          </div>
-          <div className="mt-2 pt-2 border-t border-gray-200">
-            <div className="text-[10px] text-gray-500">
-              💡 Tip: Use dark map for vivid heatmap
-            </div>
           </div>
         </div>
       )}
@@ -454,19 +656,17 @@ const MapComponent = ({ predictions = [], loading = false, selectedMetal = 'Stee
         style={{ height: '100%', width: '100%' }}
         className="z-0"
       >
-        {darkMode ? (
-          <TileLayer
-            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors &copy; <a href="https://carto.com/attributions">CARTO</a>'
-            url="https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png"
-          />
-        ) : (
-          <TileLayer
-            attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-            url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-          />
-        )}
+        {/* Panes to control z-index ordering */}
+        <Pane name="heat-pane" style={{ zIndex: 410 }} />
+        <Pane name="grid-pane" style={{ zIndex: 420 }} />
+        <Pane name="mask-pane" style={{ zIndex: 640 }} />
+        <Pane name="marker-top" style={{ zIndex: 650 }} />
+        <TileLayer
+          attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+        />
         
-        <MapUpdater predictions={predictions} heatmapData={heatmapData} showHeatmap={showHeatmap} showGrid={showGrid} />
+        <MapUpdater predictions={predictions} heatmapData={heatmapData} showHeatmap={showHeatmap} showGrid={false} hiResPending={hiResPending} selectedMetal={selectedMetal} onHeatmapRangeChange={setHeatRange} />
         
         {showMarkers && predictions.map((pred, idx) => {
           try {
@@ -483,29 +683,45 @@ const MapComponent = ({ predictions = [], loading = false, selectedMetal = 'Stee
             }
 
             const rate = pred.predicted_corrosion_rate;
-            const color = getColor(rate);
+            const color = getColorForMetal(selectedMetal, rate);
             const unit = pred.unit || '';
             
             return (
               <CircleMarker
-                key={idx}
+                key={`${lat},${lon}-${rate}`}
                 center={[lat, lon]}
-                radius={6}
+                radius={7}
                 fillColor={color}
                 fillOpacity={0.8}
                 color="#fff"
                 weight={1.5}
+                renderer={markerRendererRef.current}
               >
                 <Popup>
-                  <div className="text-sm">
-                    <div className="font-bold mb-1 capitalize">{selectedMetal} Corrosion</div>
-                    <div>Rate: <span className="font-semibold">{rate.toFixed(2)} {unit}</span></div>
-                    <div className="text-xs text-gray-600 mt-1">
-                      Location: {lat.toFixed(4)}, {lon.toFixed(4)}
+                  <div className="text-sm max-w-xs">
+                    <div className="font-bold mb-2 capitalize text-base border-b pb-1">{selectedMetal} Corrosion</div>
+                    <div className="mb-2">
+                      <span className="font-semibold">Rate:</span> {rate.toFixed(2)} {unit}
                     </div>
-                    {pred.data_points_used && (
-                      <div className="text-xs text-gray-600">
-                        Data points: {pred.data_points_used}
+                    <div className="text-xs text-gray-600 mb-2">
+                      <div><span className="font-semibold">Location:</span> {lat.toFixed(4)}, {lon.toFixed(4)}</div>
+                      {pred.data_points_used && (
+                        <div><span className="font-semibold">Data points:</span> {pred.data_points_used}</div>
+                      )}
+                    </div>
+                    {pred.features && Object.keys(pred.features).length > 0 && (
+                      <div className="mt-2 pt-2 border-t">
+                        <div className="font-semibold text-xs mb-1 text-gray-700">Environmental Features:</div>
+                        <div className="space-y-0.5 max-h-48 overflow-y-auto">
+                          {Object.entries(pred.features).map(([key, value]) => (
+                            <div key={key} className="text-xs flex justify-between">
+                              <span className="text-gray-600 mr-2">{key.replace(/_/g, ' ')}:</span>
+                              <span className="font-medium text-gray-800">
+                                {typeof value === 'number' ? value.toFixed(3) : value}
+                              </span>
+                            </div>
+                          ))}
+                        </div>
                       </div>
                     )}
                   </div>
@@ -519,36 +735,61 @@ const MapComponent = ({ predictions = [], loading = false, selectedMetal = 'Stee
         })}
       </MapContainer>
 
-      {/* Legend */}
-      <div className="absolute bottom-6 right-6 bg-white p-4 rounded-lg shadow-xl z-[1000] border-2 border-gray-200">
-        <div className="text-sm font-bold mb-3 text-gray-800 flex items-center">
-          <span className="mr-2">📊</span>
-          Corrosivity Category
+      {/* Legends (collapsible) */}
+      <div className="absolute bottom-6 right-6 space-y-3 z-[1000]">
+        {/* Heatmap continuous scale legend */}
+        <div className="bg-white rounded-lg shadow-xl border-2 border-gray-200 overflow-hidden min-w-[260px]">
+          <button className="w-full text-left px-4 py-2 bg-gray-100 border-b border-gray-200 flex items-center justify-between" onClick={() => setShowHeatLegend(v => !v)}>
+            <span className="text-sm font-bold text-gray-800">Heatmap Scale (g/m²/yr)</span>
+            <span className="text-xs text-gray-600">{showHeatLegend ? '▾' : '▸'}</span>
+          </button>
+          {showHeatLegend && (
+            <div className="p-3">
+              <div className="h-3 rounded" style={{background: 'linear-gradient(to right, #0000ff, #00ffff, #00ff00, #ffff00, #ff7f00, #ff0000)'}}></div>
+              {heatTicks.length > 0 ? (
+                <div className="flex justify-between text-[10px] text-gray-600 mt-1">
+                  {heatTicks.map((v, i) => (
+                    <span key={i}>{v.toFixed(1)}</span>
+                  ))}
+                </div>
+              ) : (
+                <div className="flex justify-between text-[10px] text-gray-600 mt-1">
+                  <span>Low</span>
+                  <span>High</span>
+                </div>
+              )}
+            </div>
+          )}
         </div>
-        <div className="space-y-2">
-          {[
-            { color: '#00ff00', label: 'C1-C2: < 250', desc: 'Very Low-Low', icon: '🟢' },
-            { color: '#7fff00', label: 'C2-C3: 250-400', desc: 'Low-Medium', icon: '🟡' },
-            { color: '#ffff00', label: 'C3-C4: 400-550', desc: 'Medium-High', icon: '🟡' },
-            { color: '#ff7f00', label: 'C4-C5: 550-700', desc: 'High-Very High', icon: '🟠' },
-            { color: '#ff0000', label: 'C5-CX: > 700', desc: 'Very High-Extreme', icon: '🔴' }
-          ].map((item, idx) => (
-            <div key={idx} className="flex items-center space-x-2 hover:bg-gray-50 p-1 rounded">
-              <div 
-                className="w-5 h-5 rounded-full border-2 border-gray-400 shadow-sm" 
-                style={{ backgroundColor: item.color }}
-              ></div>
-              <div className="flex flex-col flex-1">
-                <span className="text-xs font-semibold text-gray-700">{item.label}</span>
-                <span className="text-[10px] text-gray-500">{item.desc}</span>
+        {/* Category legend */}
+        <div className="bg-white rounded-lg shadow-xl border-2 border-gray-200 overflow-hidden min-w-[260px]">
+          <button className="w-full text-left px-4 py-2 bg-gray-100 border-b border-gray-200 flex items-center justify-between" onClick={() => setShowCategoryLegend(v => !v)}>
+            <span className="text-sm font-bold text-gray-800">Corrosivity Category ({String(selectedMetal).charAt(0).toUpperCase() + String(selectedMetal).slice(1)})</span>
+            <span className="text-xs text-gray-600">{showCategoryLegend ? '▾' : '▸'}</span>
+          </button>
+          {showCategoryLegend && (
+            <div className="p-4">
+              <div className="space-y-2">
+                {getLegendItems(selectedMetal).map((item, idx) => (
+                  <div key={idx} className="flex items-center space-x-2 hover:bg-gray-50 p-1 rounded">
+                    <div 
+                      className="w-5 h-5 rounded-full border-2 border-gray-400 shadow-sm" 
+                      style={{ backgroundColor: item.color }}
+                    ></div>
+                    <div className="flex flex-col flex-1">
+                      <span className="text-xs font-semibold text-gray-700">{item.label}</span>
+                      <span className="text-[10px] text-gray-500">{item.desc}</span>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              <div className="mt-3 pt-3 border-t-2 border-gray-200">
+                <div className="text-[10px] text-gray-600 font-medium">
+                  Unit: g/m²/yr (ISO 9223)
+                </div>
               </div>
             </div>
-          ))}
-        </div>
-        <div className="mt-3 pt-3 border-t-2 border-gray-200">
-          <div className="text-[10px] text-gray-600 font-medium">
-            📏 Unit: g/m²/yr (ISO 9223)
-          </div>
+          )}
         </div>
       </div>
     </div>

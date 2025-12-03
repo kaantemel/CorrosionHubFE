@@ -3,8 +3,7 @@ import React from 'react';
 const METAL_TYPES = [
   { id: 'steel', label: 'Steel', color: 'bg-gray-600' },
   { id: 'zinc', label: 'Zinc', color: 'bg-blue-500' },
-  { id: 'copper', label: 'Copper', color: 'bg-orange-600' },
-  { id: 'aluminium', label: 'Aluminium', color: 'bg-slate-400' }
+  { id: 'copper', label: 'Copper', color: 'bg-orange-600' }
 ];
 
 const Navigation = ({ selectedMetal, onMetalChange }) => {
@@ -28,8 +27,8 @@ const Navigation = ({ selectedMetal, onMetalChange }) => {
             </svg>
           </div>
           <div>
-            <h1 className="text-xl font-bold">Corrosion Prediction</h1>
-            <p className="text-xs text-gray-400">Environmental Monitoring System</p>
+            <h1 className="text-xl font-bold">Corrosion Hub</h1>
+            <p className="text-xs text-gray-400">Corrosion Monitoring System</p>
           </div>
         </div>
 
