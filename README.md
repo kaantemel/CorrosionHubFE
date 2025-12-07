@@ -114,6 +114,35 @@ src/
 └── main.jsx
 ```
 
+## Deployment to Vercel
+
+### Prerequisites
+1. Push your code to a GitHub repository
+2. Have your backend API deployed and accessible
+
+### Steps
+
+1. **Import Project to Vercel**
+   - Go to [vercel.com](https://vercel.com) and sign in with GitHub
+   - Click "Add New Project" and select your repository
+   - Vercel will auto-detect Vite configuration
+
+2. **Configure Environment Variables**
+   - In Vercel project settings, add environment variable:
+     ```
+     VITE_API_BASE_URL = https://your-backend-api-url.com
+     ```
+   - Replace with your actual backend API URL
+
+3. **Deploy**
+   - Click "Deploy"
+   - Vercel will build and deploy automatically
+   - Get your production URL (e.g., `https://corrosion-hub.vercel.app`)
+
+### Automatic Deployments
+- Every push to `main` branch triggers automatic deployment
+- Pull requests create preview deployments
+
 ## Development
 
 Built with modular, swappable components. The map visualization layer can be replaced by updating `src/components/Map/index.js` to import a different map implementation (e.g., ArcGIS, Mapbox).
