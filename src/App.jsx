@@ -106,7 +106,7 @@ function App() {
     console.log('Fetching predictions:', { startDate, endDate, metal });
 
     try {
-      const response = await axios.post(`${API_BASE_URL}/predict`, {
+      const response = await axios.post(`${API_BASE_URL}/datapoints`, {
         start_date: startDate,
         end_date: endDate,
         metal_type: metal
@@ -149,7 +149,7 @@ function App() {
           mask_geojson_path: 'Germany_ADM0.geojson',
           include_nulls: false
         };
-        const smoothResp = await axios.post(`${API_BASE_URL}/predict-smooth`, smoothBody);
+        const smoothResp = await axios.post(`${API_BASE_URL}/heatmap`, smoothBody);
         let smoothData = [];
         if (Array.isArray(smoothResp.data?.points)) {
           smoothData = smoothResp.data.points;
